@@ -4,6 +4,9 @@
 
 package ringbuffer
 
+// [Golang如何实现一个环形缓冲器（ringbuffer）](https://juejin.cn/post/7138675261649715236)
+// [高性能环形队列及其实现](https://hedzr.com/algorithm/golang/ringbuf-index/)
+
 import (
 	"context"
 	"errors"
@@ -12,6 +15,7 @@ import (
 	"unsafe"
 )
 
+// “哨兵”错误处理策略，错误可导出
 var (
 	ErrTooMuchDataToWrite = errors.New("too much data to write")
 	ErrIsFull             = errors.New("ringbuffer is full")
@@ -21,20 +25,32 @@ var (
 	ErrWriteOnClosed      = errors.New("write on closed ringbuffer")
 )
 
+// 支持并发读写（线程安全）
 // RingBuffer is a circular buffer that implement io.ReaderWriter interface.
 // It operates like a buffered pipe, where data written to a RingBuffer
 // and can be read back from another goroutine.
 // It is safe to concurrently read and write RingBuffer.
 type RingBuffer struct {
-	buf       []byte
-	size      int
-	r         int // next position to read
-	w         int // next position to write
-	isFull    bool
-	err       error
-	block     bool
-	mu        sync.Mutex
-	wg        sync.WaitGroup
+	// 字节切片，1byte=1bit
+	buf    []byte
+	size   int
+	r      int // next position to read
+	w      int // next position to write
+	isFull bool
+	err    error
+	block  bool
+	// 支持并发读写（线程安全）
+	mu sync.Mutex
+	// Reset的时候用
+	wg sync.WaitGroup
+	// sync.Cond基于互斥锁/读写锁
+	// 互斥锁sync.Mutex通常用来保护临界区和共享资源
+	// 条件变量sync.Cond用来协调想要访问共享资源的goroutine
+	// sync.Cond方法
+	// NewCond：创建实例
+	// Broadcast: 广播唤醒所有
+	// Signal: 唤醒一个协程
+	// Wait: 等待
 	readCond  *sync.Cond // Signalled when data has been read.
 	writeCond *sync.Cond // Signalled when data has been written.
 }
@@ -42,6 +58,9 @@ type RingBuffer struct {
 // New returns a new RingBuffer whose buffer has the given size.
 func New(size int) *RingBuffer {
 	return &RingBuffer{
+		// make: 用于创建并初始化特定类型的内建数据结构：切片、映射、通道
+		// make([]T, size, cap)：创建一个切片，元素个数为size，容量为cap，并返回切片的引用
+		// new：用于分配内存，但不进行初始化，返回的是指向分配内存的指针
 		buf:  make([]byte, size),
 		size: size,
 	}
@@ -98,7 +117,9 @@ func (r *RingBuffer) setErr(err error, locked bool) error {
 	default:
 		r.err = err
 		if r.block {
+			// 已读，有空间，通知可写
 			r.readCond.Broadcast()
+			// 已写，有数据，通知可读
 			r.writeCond.Broadcast()
 		}
 	}
@@ -106,12 +127,20 @@ func (r *RingBuffer) setErr(err error, locked bool) error {
 }
 
 func (r *RingBuffer) readErr(locked bool) error {
+	// 线程安全，读写时都需要加锁，很讨厌
+	// 不管是性能上，还是代码层面，无锁可能是一个优化点
+	// 是否已经上锁
 	if !locked {
 		r.mu.Lock()
 		defer r.mu.Unlock()
 	}
+	// io.EOF: End-Of-File
+	// 是Go中重要的错误变量，用户表示输入流的结尾，因为每个文件都有一个结尾，
+	// 所以io.EOF很多时候并不能算是一个错误，更重要是表示输入流结束了
+	// [io.EOF设计的缺陷和改进](https://mp.weixin.qq.com/s/DPtujfVNMw_Jgel_zGTFvw)
 	if r.err != nil {
 		if r.err == io.EOF {
+			// 表示数组已空
 			if r.w == r.r && !r.isFull {
 				return io.EOF
 			}
@@ -122,6 +151,9 @@ func (r *RingBuffer) readErr(locked bool) error {
 	return nil
 }
 
+// 实现了io.Reader接口
+// 利用io.Reader可以实现流式数据传输，Reader方法内部是被循环调用的，
+// 每次迭代，会从数据源读取一块数据放入缓冲区p中，直到返回io.EOF错误时停止
 // Read reads up to len(p) bytes into p. It returns the number of bytes read (0 <= n <= len(p)) and any error encountered.
 // Even if Read returns n < len(p), it may use all of p as scratch space during the call.
 // If some data is available but not len(p) bytes, Read conventionally returns what is available instead of waiting for more.
@@ -130,19 +162,25 @@ func (r *RingBuffer) readErr(locked bool) error {
 // Callers should always process the n > 0 bytes returned before considering the error err.
 // Doing so correctly handles I/O errors that happen after reading some bytes and also both of the allowed EOF behaviors.
 func (r *RingBuffer) Read(p []byte) (n int, err error) {
+	// 理论上是缓冲区p空，为什么要readErr
 	if len(p) == 0 {
 		return 0, r.readErr(false)
 	}
 
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	// 提前判断是否有error
 	if err := r.readErr(true); err != nil {
 		return 0, err
 	}
 
+	// sync.WaitGroup
+	// 调用Add后，必要调用done
+	// 可以不用调用Wait
 	r.wg.Add(1)
 	defer r.wg.Done()
 	n, err = r.read(p)
+	// 空的，需要等待已写通知，写完即可读
 	for err == ErrIsEmpty && r.block {
 		r.writeCond.Wait()
 		if err = r.readErr(true); err != nil {
@@ -150,6 +188,7 @@ func (r *RingBuffer) Read(p []byte) (n int, err error) {
 		}
 		n, err = r.read(p)
 	}
+	// 已经读取了部分，通知可写了
 	if r.block && n > 0 {
 		r.readCond.Broadcast()
 	}
@@ -159,11 +198,17 @@ func (r *RingBuffer) Read(p []byte) (n int, err error) {
 // TryRead read up to len(p) bytes into p like Read but it is not blocking.
 // If it has not succeeded to acquire the lock, it return 0 as n and ErrAcquireLock.
 func (r *RingBuffer) TryRead(p []byte) (n int, err error) {
+	// 非阻塞模式去锁操作
+	// Go 1.18新特性，保持语言简单性，引入反复讨论
+	// [Go1.18 新特性：三顾茅庐，被折腾 N 次的 TryLock](https://juejin.cn/post/7064789056873300004)
 	ok := r.mu.TryLock()
 	if !ok {
 		return 0, ErrAcquireLock
 	}
+	// 锁申请成功后，不要忘了释放
 	defer r.mu.Unlock()
+	// ?为什么要判断readErr
+	// 判空
 	if err := r.readErr(true); err != nil {
 		return 0, err
 	}
@@ -179,26 +224,36 @@ func (r *RingBuffer) TryRead(p []byte) (n int, err error) {
 }
 
 func (r *RingBuffer) read(p []byte) (n int, err error) {
+	// 队列为空或队列满了，所以需要同时判断是否空
 	if r.w == r.r && !r.isFull {
 		return 0, ErrIsEmpty
 	}
 
+	// 没有形成环，不需要考虑环的问题
 	if r.w > r.r {
 		n = r.w - r.r
+		// 确认读取长度
 		if n > len(p) {
 			n = len(p)
 		}
+		// 切片深拷贝
 		copy(p, r.buf[r.r:r.r+n])
+		// 取余可以处理环的情况
+		// 没有出现环：7 % 10 = 7
+		// 出现环了：13 % 10 = 3
 		r.r = (r.r + n) % r.size
 		return
 	}
 
+	// 形成环了
+	// 先计算正向的部分，再计算环的部分
 	n = r.size - r.r + r.w
 	if n > len(p) {
 		n = len(p)
 	}
 
 	if r.r+n <= r.size {
+		// 需要读取的大小小于正向长度
 		copy(p, r.buf[r.r:r.r+n])
 	} else {
 		c1 := r.size - r.r
@@ -206,6 +261,9 @@ func (r *RingBuffer) read(p []byte) (n int, err error) {
 		c2 := n - c1
 		copy(p[c1:], r.buf[0:c2])
 	}
+	// 取余可以处理环的情况
+	// 没有出现环：7 % 10 = 7
+	// 出现环了：13 % 10 = 3
 	r.r = (r.r + n) % r.size
 
 	r.isFull = false
@@ -241,6 +299,7 @@ func (r *RingBuffer) ReadByte() (b byte, err error) {
 	return b, r.readErr(true)
 }
 
+// 实现了io.Writer接口：表示一个编写器，从缓存区读取数据，并将数据源写入目标资源
 // Write writes len(p) bytes from p to the underlying buf.
 // It returns the number of bytes written from p (0 <= n <= len(p))
 // and any error encountered that caused the write to stop early.
@@ -253,6 +312,7 @@ func (r *RingBuffer) Write(p []byte) (n int, err error) {
 	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	// 获取锁后，就要判断一次当前状态
 	if err := r.err; err != nil {
 		if err == io.EOF {
 			err = ErrWriteOnClosed
@@ -268,7 +328,9 @@ func (r *RingBuffer) Write(p []byte) (n int, err error) {
 		}
 		err = r.setErr(err, true)
 		if r.block && (err == ErrIsFull || err == ErrTooMuchDataToWrite) {
+			// 已写，有数据，通知可读
 			r.writeCond.Broadcast()
+			// 等待已读通知，可继续写
 			r.readCond.Wait()
 			p = p[n:]
 			err = nil
@@ -308,6 +370,7 @@ func (r *RingBuffer) TryWrite(p []byte) (n int, err error) {
 	return n, r.setErr(err, true)
 }
 
+// 返回error: ErrIsFull, ErrTooMuchDataToWrite
 func (r *RingBuffer) write(p []byte) (n int, err error) {
 	if r.isFull {
 		return 0, ErrIsFull
@@ -545,10 +608,13 @@ func (r *RingBuffer) CloseWriter() {
 // Flush waits for the buffer to be empty and fully read.
 // If not blocking ErrIsNotEmpty will be returned if the buffer still contains data.
 func (r *RingBuffer) Flush() error {
+	// 数组非空
 	for !r.IsEmpty() {
+		// 非阻塞
 		if !r.block {
 			return r.setErr(ErrIsNotEmpty, false)
 		}
+		// 阻塞
 		r.mu.Lock()
 		r.readCond.Wait()
 		err := r.readErr(true)
